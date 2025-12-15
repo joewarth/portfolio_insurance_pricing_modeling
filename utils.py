@@ -22,6 +22,7 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import TweedieRegressor
 from scipy.optimize import minimize_scalar
 from patsy import dmatrix, build_design_matrices
+from sklearn.base import BaseEstimator, TransformerMixin
 
 def fmt_cap(cap):
     if cap is None: return "uncapped"
@@ -743,3 +744,84 @@ def evaluate_spline_scenario_cv(
 
     score = float(np.mean(devs)) if devs else np.nan
     return {**scenario, "score": score}
+
+class PatsySplineTransformer(BaseEstimator, TransformerMixin):
+    """
+    Build a spline design matrix using a patsy formula (e.g., bs(...)).
+    Stores design_info on fit so transform uses the same columns.
+    """
+    def __init__(self, formula: str):
+        self.formula = formula
+        self.design_info_ = None
+        self.feature_names_ = None
+
+    def fit(self, X, y=None):
+        X = X if isinstance(X, pd.DataFrame) else pd.DataFrame(X)
+        dm = dmatrix(self.formula, X, return_type="dataframe")
+        self.design_info_ = dm.design_info
+        self.feature_names_ = dm.columns.to_list()
+        return self
+
+    def transform(self, X):
+        X = X if isinstance(X, pd.DataFrame) else pd.DataFrame(X)
+        dm = build_design_matrices([self.design_info_], X)[0]
+        return np.asarray(dm)
+
+    def get_feature_names_out(self, input_features=None):
+        return np.array(self.feature_names_, dtype=object)
+    
+def assign_weighted_deciles(score: pd.Series, weight: pd.Series, n=10) -> pd.Series:
+    """Return decile labels 1..n so each bucket has ~equal total weight."""
+    s = pd.DataFrame({"score": score, "w": weight}).sort_values("score").reset_index()
+    s["cw"] = s["w"].cumsum()
+    total = s["w"].sum()
+    # bins are based on cumulative weight share
+    s["decile"] = np.ceil(n * s["cw"] / total).astype(int).clip(1, n)
+    out = pd.Series(index=s["index"], data=s["decile"].values)
+    return out.reindex(score.index)
+
+def lift_table_by_decile(
+    df: pd.DataFrame,
+    y_pp_col: str,
+    pred_pp: np.ndarray,
+    exposure_col: str = "Exposure",
+    n_deciles: int = 10,
+):
+    d = df.copy()
+    d = d.loc[d[exposure_col] > 0].copy()
+
+    d["pred_pp"] = pred_pp
+    d["actual_loss"] = d[y_pp_col] * d[exposure_col]
+    d["pred_loss"] = d["pred_pp"] * d[exposure_col]
+
+    d["decile"] = assign_weighted_deciles(d["pred_pp"], d[exposure_col], n=n_deciles)
+
+    g = (d.groupby("decile", as_index=False)
+           .agg(
+               exposure=(exposure_col, "sum"),
+               actual_loss=("actual_loss", "sum"),
+               pred_loss=("pred_loss", "sum"),
+           ))
+
+    g["actual_pp"] = g["actual_loss"] / g["exposure"]
+    g["pred_pp"]   = g["pred_loss"]   / g["exposure"]
+
+    port_actual_pp = d["actual_loss"].sum() / d[exposure_col].sum()
+    port_pred_pp   = d["pred_loss"].sum()   / d[exposure_col].sum()
+
+    g["actual_lift"] = g["actual_pp"] / port_actual_pp
+    g["pred_lift"]   = g["pred_pp"]   / port_pred_pp
+
+    return g, port_actual_pp, port_pred_pp
+
+def plot_lift(g: pd.DataFrame, title="Lift Chart (Exposure-Weighted Deciles)"):
+    plt.figure()
+    plt.plot(g["decile"], g["actual_lift"], marker="o", label="Actual lift")
+    plt.plot(g["decile"], g["pred_lift"], marker="o", label="Predicted lift")
+    plt.axhline(1.0, linestyle="--")
+    plt.xlabel("Prediction decile (1 = lowest predicted risk, 10 = highest)")
+    plt.ylabel("Relativity vs portfolio")
+    plt.title(title)
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
