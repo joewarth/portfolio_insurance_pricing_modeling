@@ -825,3 +825,37 @@ def plot_lift(g: pd.DataFrame, title="Lift Chart (Exposure-Weighted Deciles)"):
     plt.legend()
     plt.tight_layout()
     plt.show()
+
+def gini_and_gain_curve(glm, df, y_pp_col="pure_premium_capped_1MIL", exposure_col="Exposure"):
+    d = df.loc[df[exposure_col] > 0].copy()
+
+    # predicted pure premium from statsmodels GLM
+    d["pred_pp"] = glm.predict(d)
+
+    # convert to loss for a proper concentration/gain curve
+    d["actual_loss"] = d[y_pp_col] * d[exposure_col]
+
+    # sort highest predicted risk first
+    d = d.sort_values("pred_pp", ascending=False).reset_index(drop=True)
+
+    x = d[exposure_col].cumsum().to_numpy()
+    y = d["actual_loss"].cumsum().to_numpy()
+
+    x_share = np.r_[0.0, x / x[-1]]
+    y_share = np.r_[0.0, y / y[-1]]
+
+    auc = np.trapz(y_share, x_share)
+    gini = 2 * auc - 1
+
+    # Gain / Lorenz-style curve
+    plt.figure()
+    plt.plot(x_share, y_share, label=f"Gain curve (Gini={gini:.4f})")
+    plt.plot([0, 1], [0, 1], linestyle="--", label="Diagonal")
+    plt.xlabel("Cumulative exposure share")
+    plt.ylabel("Cumulative actual loss share")
+    plt.title("Gain Curve")
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+    return gini
